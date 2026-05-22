@@ -30,6 +30,7 @@ load_dotenv(Path(__file__).parent / ".env")
 import action as A
 import decision as D
 import perception as P
+from audit import AuditLogger
 from memory import get_memory_snapshot, load_sessions, save_session
 from schemas import AgentState, ResearchSession
 
@@ -125,13 +126,30 @@ async def _research_loop(
     mcp: ClientSession,
     verbose: bool = False,
 ) -> str:
+    import time as _time
+
     session = ResearchSession(query=query)
     state = AgentState(session=session)
     save_session(session)
 
-    # Perception
+    audit = AuditLogger(session.session_id, query)
+    audit.session_start(query)
+
+    # ── Perception ────────────────────────────────────────────────────────────
+    t0 = _time.monotonic()
     with Progress(SpinnerColumn(), TextColumn("[cyan]Perceiving query..."), transient=True, console=console):
         perc = P.perceive(query)
+    perc_ms = int((_time.monotonic() - t0) * 1000)
+
+    # Detect whether LLM was used: fallback sets topic="research", ambiguity=0.5
+    perc_llm_ok = not (perc.intent.topic == "research" and perc.ambiguity_score == 0.5)
+    audit.perception(
+        topic=perc.intent.topic,
+        entities=perc.entities,
+        ambiguity=perc.ambiguity_score,
+        llm_ok=perc_llm_ok,
+        duration_ms=perc_ms,
+    )
 
     state.perception = perc
     console.print(
@@ -142,19 +160,22 @@ async def _research_loop(
 
     if perc.clarification_needed:
         console.print(f"\n[yellow]Clarification needed:[/yellow] {perc.clarification_question}")
+        audit.session_end("clarification_needed", 0, 0)
         return "Query too ambiguous to research -- please clarify."
 
-    # Memory query short-circuit
+    # ── Memory query short-circuit ────────────────────────────────────────────
     if perc.intent.is_memory_query:
         console.print("[cyan]-> Memory query detected -- consulting stored knowledge[/cyan]")
         snapshot = get_memory_snapshot(perc.intent.topic, perc.entities)
         if snapshot["total_facts"] == 0:
+            audit.session_end("no_memory", 0, 0)
             return "No stored knowledge found on this topic. Run a fresh research query first."
         ar = A.run_summarize(state, perc)
         conclusion = ar.data or "No conclusion could be generated."
         session.conclusion = conclusion
         session.status = "completed"
         save_session(session)
+        audit.session_end("memory_query", snapshot["total_facts"], 0)
         return conclusion
 
     last_fetched_text: str = ""
@@ -164,8 +185,23 @@ async def _research_loop(
         state.iteration = iteration
         session.iterations = iteration
 
-        # Decision
+        # ── Decision ──────────────────────────────────────────────────────────
+        t0 = _time.monotonic()
         dec = D.decide(state, perc)
+        dec_ms = int((_time.monotonic() - t0) * 1000)
+
+        # Fallback decisions have no reason text or have "fallback:" prefix
+        dec_llm_ok = bool(dec.reason and not dec.reason.startswith("fallback"))
+        audit.decision(
+            iteration=iteration,
+            action=dec.action,
+            reason=dec.reason,
+            confidence=dec.confidence,
+            llm_ok=dec_llm_ok,
+            converged=dec.converged,
+            duration_ms=dec_ms,
+        )
+
         _step(iteration, dec.action, dec.reason)
         state.action_history.append(dec.action)
 
@@ -173,28 +209,35 @@ async def _research_loop(
         if dec.action == "web_search":
             query_str = dec.query or perc.intent.primary_goal
             if query_str in state.search_queries_used:
-                # Modify query to avoid repetition
                 query_str += f" {perc.intent.topic} latest"
             state.search_queries_used.append(query_str)
 
+            audit.action_start(iteration, "web_search", {"query": query_str})
             ar = await A.run_web_search(mcp, query_str)
             if ar.success and ar.data:
                 results = ar.data
-                _result_ok(f"Got {len(results)} results")
                 new_urls = [r.url for r in results if r.url and r.url not in state.urls_visited]
                 state.pending_urls = new_urls[:5]
+                audit.action_end(iteration, "web_search", True, {
+                    "result_count": len(results),
+                    "new_urls": len(new_urls),
+                    "urls": [r.url for r in results],
+                })
+                _result_ok(f"Got {len(results)} results")
                 if verbose:
                     for r in results:
                         console.print(f"    [dim]{r.title[:60]}[/dim]  {r.url}")
             else:
+                audit.action_end(iteration, "web_search", False, error=ar.error)
                 _result_warn(f"Search failed: {ar.error}")
 
         # ── fetch_url ─────────────────────────────────────────────────────────
         elif dec.action == "fetch_url":
             url = dec.url or (state.pending_urls[0] if state.pending_urls else "")
             if not url:
+                audit.action_end(iteration, "fetch_url", False, error="no URL available")
                 _result_warn("No URL to fetch -- switching to web_search next")
-                state.action_history[-1] = "web_search"  # correct history
+                state.action_history[-1] = "web_search"
                 continue
             if url in state.urls_visited:
                 if state.pending_urls:
@@ -205,20 +248,35 @@ async def _research_loop(
             if url in state.pending_urls:
                 state.pending_urls.remove(url)
 
+            audit.action_start(iteration, "fetch_url", {"url": url})
             ar = await A.run_fetch_url(mcp, url)
             if ar.success and ar.data:
                 content = ar.data.get("text", "") if isinstance(ar.data, dict) else str(ar.data)
+                http_status = ar.data.get("status", 0) if isinstance(ar.data, dict) else 0
                 last_fetched_text = content
                 last_fetched_url = url
+                audit.action_end(iteration, "fetch_url", True, {
+                    "url": url,
+                    "http_status": http_status,
+                    "chars": len(content),
+                })
                 _result_ok(f"Fetched {len(content):,} chars from {url}")
             else:
+                audit.action_end(iteration, "fetch_url", False, {"url": url}, error=ar.error)
                 _result_warn(f"Fetch failed: {ar.error}")
 
         # ── memory_lookup ─────────────────────────────────────────────────────
         elif dec.action == "memory_lookup":
+            audit.action_start(iteration, "memory_lookup", {
+                "topic": perc.intent.topic, "entities": perc.entities,
+            })
             ar = A.run_memory_lookup(perc.intent.topic, perc.entities)
             snap = ar.data or {}
             n = snap.get("total_facts", 0)
+            audit.action_end(iteration, "memory_lookup", True, {
+                "facts_found": n,
+                "prior_sessions": len(snap.get("prior_sessions", [])),
+            })
             _result_ok(f"Memory: {n} relevant facts, {len(snap.get('prior_sessions', []))} prior sessions")
             if verbose and snap.get("facts"):
                 for f in snap["facts"][:3]:
@@ -227,51 +285,74 @@ async def _research_loop(
         # ── save_memory ───────────────────────────────────────────────────────
         elif dec.action == "save_memory":
             if not last_fetched_text:
+                audit.action_end(iteration, "save_memory", False, error="no fetched content")
                 _result_warn("No fetched content to save -- skipping")
                 continue
+            audit.action_start(iteration, "save_memory", {
+                "url": last_fetched_url, "content_chars": len(last_fetched_text),
+            })
             ar = await A.run_save_memory(state, perc, last_fetched_text, last_fetched_url)
             if ar.success and ar.data:
                 n = len(ar.data)
                 session.facts_found += n
-                _result_ok(f"Saved {n} facts  (total: {session.facts_found})")
                 contradictions = [f for f in ar.data if f.contradicts]
+                audit.action_end(iteration, "save_memory", True, {
+                    "facts_saved": n,
+                    "total_facts": session.facts_found,
+                    "contradictions": len(contradictions),
+                    "llm_used": all(f.confidence >= 0.7 for f in ar.data),
+                })
+                _result_ok(f"Saved {n} facts  (total: {session.facts_found})")
                 if contradictions:
                     _result_warn(f"{len(contradictions)} fact(s) contradict prior knowledge!")
             else:
+                audit.action_end(iteration, "save_memory", False, error=ar.error)
                 _result_warn(f"Save failed: {ar.error}")
-            last_fetched_text = ""  # consumed
+            last_fetched_text = ""
 
         # ── summarize ─────────────────────────────────────────────────────────
         elif dec.action in ("summarize", "done"):
+            audit.action_start(iteration, "summarize", {"facts_available": session.facts_found})
             ar = A.run_summarize(state, perc)
             conclusion = ar.data if ar.success else f"(summarize failed: {ar.error})"
+            audit.action_end(iteration, "summarize", ar.success, {
+                "conclusion_chars": len(conclusion),
+            }, error=ar.error if not ar.success else None)
             session.conclusion = conclusion
             session.status = "completed"
             session.ended_at = datetime.now(timezone.utc).isoformat()
             save_session(session)
+            audit.session_end("completed", session.facts_found, iteration)
             _result_ok("Conclusion generated")
             return conclusion
 
-        # Save progress after every iteration
         save_session(session)
 
         if dec.converged and dec.action not in ("summarize", "done"):
             console.print("  [green]✓ Converged -- generating conclusion[/green]")
+            audit.action_start(iteration, "summarize", {"facts_available": session.facts_found})
             ar = A.run_summarize(state, perc)
             conclusion = ar.data if ar.success else "(summarize failed)"
+            audit.action_end(iteration, "summarize", ar.success, {
+                "conclusion_chars": len(conclusion),
+            })
             session.conclusion = conclusion
             session.status = "completed"
             session.ended_at = datetime.now(timezone.utc).isoformat()
             save_session(session)
+            audit.session_end("converged", session.facts_found, iteration)
             return conclusion
 
-    # Exhausted all iterations without explicit done
+    # Exhausted iterations
+    audit.action_start(D.MAX_ITERATIONS, "summarize", {"facts_available": session.facts_found})
     ar = A.run_summarize(state, perc)
     conclusion = ar.data if ar.success else "Research reached iteration limit without a clear conclusion."
+    audit.action_end(D.MAX_ITERATIONS, "summarize", ar.success, {"conclusion_chars": len(conclusion)})
     session.conclusion = conclusion
     session.status = "completed"
     session.ended_at = datetime.now(timezone.utc).isoformat()
     save_session(session)
+    audit.session_end("max_iterations", session.facts_found, D.MAX_ITERATIONS)
     return conclusion
 
 

@@ -105,6 +105,36 @@ Extract factual claims relevant to the research goal. Reply:
 }}"""
 
 
+def _extract_facts_heuristic(
+    content: str,
+    url: str,
+    topic: str,
+    entities: list[str],
+    session_id: str,
+) -> list[Fact]:
+    """No-LLM fallback: pull sentences that mention the topic keywords."""
+    import re
+    keywords = {w.lower() for e in ([topic] + entities) for w in e.split() if len(w) > 3}
+    sentences = re.split(r"(?<=[.!?])\s+", content)
+    facts: list[Fact] = []
+    for sent in sentences:
+        sent = sent.strip()
+        if len(sent) < 40 or len(sent) > 300:
+            continue
+        low = sent.lower()
+        if any(kw in low for kw in keywords):
+            facts.append(Fact(
+                content=sent,
+                source_url=url,
+                confidence=0.5,
+                entities=entities,
+                session_id=session_id,
+            ))
+        if len(facts) >= 8:
+            break
+    return facts
+
+
 async def run_save_memory(
     state: AgentState,
     perception: PerceptionResult,
@@ -127,11 +157,19 @@ async def run_save_memory(
             temperature=0.1,
         )
         data = extract_json(resp.get("text", ""))
+        raw_facts = data.get("facts", [])
+        use_llm = bool(raw_facts)
+    except Exception as exc:
+        log.warning("[action] save_memory LLM failed (%s) — heuristic extraction", exc)
+        raw_facts = []
+        use_llm = False
 
-        existing = load_facts()
-        saved: list[Fact] = []
+    existing = load_facts()
+    saved: list[Fact] = []
 
-        for item in data.get("facts", []):
+    if use_llm:
+        items = raw_facts
+        for item in items:
             fact = Fact(
                 content=item["content"],
                 source_url=url,
@@ -142,23 +180,28 @@ async def run_save_memory(
             contradictions = detect_contradictions(fact, existing)
             if contradictions:
                 fact.contradicts = contradictions
-                log.warning(
-                    "[memory] CONTRADICTION: fact %r contradicts %s",
-                    fact.content[:60],
-                    contradictions,
-                )
+                log.warning("[memory] CONTRADICTION: %r", fact.content[:60])
+            save_fact(fact)
+            existing.append(fact)
+            for ent in fact.entities:
+                upsert_entity(ent, fact_id=fact.id)
+            saved.append(fact)
+    else:
+        for fact in _extract_facts_heuristic(
+            truncated, url, perception.intent.topic, perception.entities,
+            state.session.session_id,
+        ):
+            contradictions = detect_contradictions(fact, existing)
+            if contradictions:
+                fact.contradicts = contradictions
             save_fact(fact)
             existing.append(fact)
             for ent in fact.entities:
                 upsert_entity(ent, fact_id=fact.id)
             saved.append(fact)
 
-        log.info("[action] save_memory: stored %d facts", len(saved))
-        return ActionResult(action="save_memory", success=True, data=saved)
-
-    except Exception as exc:
-        log.error("[action] save_memory failed: %s", exc)
-        return ActionResult(action="save_memory", success=False, error=str(exc))
+    log.info("[action] save_memory: stored %d facts (llm=%s)", len(saved), use_llm)
+    return ActionResult(action="save_memory", success=True, data=saved)
 
 
 # ─── Memory lookup ────────────────────────────────────────────────────────────
@@ -201,6 +244,29 @@ Structure your report as:
 (explain the rating)"""
 
 
+def _summarize_heuristic(
+    topic: str,
+    goal: str,
+    facts: list[Fact],
+) -> str:
+    lines = [
+        f"## Research Summary: {topic}",
+        f"**Goal:** {goal}",
+        "",
+        f"**Facts gathered:** {len(facts)}  (LLM unavailable — heuristic summary)",
+        "",
+        "## Key Findings",
+    ]
+    for i, f in enumerate(facts[:15], 1):
+        conf = int(f.confidence * 10)
+        src = f.source_url or "memory"
+        lines.append(f"- [{conf}/10] {f.content}  _(source: {src})_")
+    if not facts:
+        lines.append("- No facts were gathered during this session.")
+    lines += ["", "## Overall Confidence: N/A (LLM summarization unavailable)"]
+    return "\n".join(lines)
+
+
 def run_summarize(state: AgentState, perception: PerceptionResult) -> ActionResult:
     log.info("[action] summarize session=%s", state.session.session_id)
     all_facts = load_facts()
@@ -229,5 +295,8 @@ def run_summarize(state: AgentState, perception: PerceptionResult) -> ActionResu
         conclusion = resp.get("text", "").strip() or "No conclusion could be generated."
         return ActionResult(action="summarize", success=True, data=conclusion)
     except Exception as exc:
-        log.error("[action] summarize failed: %s", exc)
-        return ActionResult(action="summarize", success=False, error=str(exc))
+        log.warning("[action] summarize LLM failed (%s) — heuristic summary", exc)
+        conclusion = _summarize_heuristic(
+            perception.intent.topic, perception.intent.primary_goal, session_facts
+        )
+        return ActionResult(action="summarize", success=True, data=conclusion)

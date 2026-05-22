@@ -6,7 +6,9 @@ Nine tools, stdio transport:
     read_file, list_dir, create_file, update_file, edit_file
 
 web_search:  Tavily primary, DuckDuckGo fallback. Hard-capped at 5 results.
-fetch_url:   crawl4ai only — clean markdown via headless Chromium.
+fetch_url:   httpx with HTML-to-text extraction. Hard 20 s timeout — never hangs.
+             crawl4ai removed: Playwright subprocesses can't be reliably cancelled
+             on Windows and cause the agent to stall indefinitely.
 Usage for tavily and duckduckgo is logged to ./usage.json with monthly
 rollover and a soft cap of 950/1000 on Tavily.
 
@@ -17,8 +19,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,7 +31,7 @@ from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-MAX_SEARCH_RESULTS = 5  # hard cap — Tavily prices per result
+MAX_SEARCH_RESULTS = 5
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -37,9 +41,22 @@ SANDBOX = Path(__file__).parent / "sandbox"
 SANDBOX.mkdir(exist_ok=True)
 
 USAGE_PATH = Path(__file__).parent / "usage.json"
-MONTHLY_CAP = 950  # leave 50/mo headroom on Tavily
+MONTHLY_CAP = 950
 _usage_lock = threading.Lock()
 
+_SKIP_TAGS = {"script", "style", "noscript", "head", "nav", "footer", "aside"}
+_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
 
 def _safe(path: str) -> Path:
     p = (SANDBOX / path).resolve()
@@ -87,6 +104,46 @@ def _under_cap(provider: str) -> bool:
     return _load_usage()[provider]["count"] < MONTHLY_CAP
 
 
+# ─── HTML → plain text ────────────────────────────────────────────────────────
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag.lower() in _SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in _SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            stripped = data.strip()
+            if stripped:
+                self._parts.append(stripped)
+
+    def text(self) -> str:
+        raw = "\n".join(self._parts)
+        # Collapse runs of blank lines
+        return re.sub(r"\n{3,}", "\n\n", raw).strip()
+
+
+def _html_to_text(html: str) -> str:
+    p = _TextExtractor()
+    try:
+        p.feed(html)
+        return p.text()
+    except Exception:
+        # Strip tags with regex as last resort
+        return re.sub(r"<[^>]+>", " ", html).strip()
+
+
+# ─── Search helpers ───────────────────────────────────────────────────────────
+
 def _tavily_search(query: str, max_results: int) -> list[dict]:
     from tavily import TavilyClient
 
@@ -122,41 +179,7 @@ def _ddg_search(query: str, max_results: int) -> list[dict]:
     ]
 
 
-async def _crawl4ai_fetch(url: str) -> dict:
-    from crawl4ai import AsyncWebCrawler
-
-    # crawl4ai uses Rich which writes via its own captured stdout reference, so
-    # contextlib.redirect_stdout doesn't catch it. Redirect at the file-descriptor
-    # level — crawl4ai's banner / [FETCH] / [SCRAPE] markers would otherwise
-    # corrupt the MCP stdio JSON-RPC stream.
-    saved_fd = os.dup(1)
-    os.dup2(2, 1)
-    try:
-        async with AsyncWebCrawler(verbose=False) as crawler:
-            r = await crawler.arun(url=url)
-    finally:
-        os.dup2(saved_fd, 1)
-        os.close(saved_fd)
-    # r.markdown is a str subclass (StringCompatibleMarkdown) that Pydantic
-    # serializes as {} because its real field is private. Pull the raw string
-    # out and force a plain str so FastMCP serializes correctly.
-    md = r.markdown
-    raw = (
-        getattr(md, "raw_markdown", None)
-        or getattr(md, "fit_markdown", None)
-        or md
-        or r.cleaned_html
-        or r.html
-        or ""
-    )
-    text = str(raw)
-    return {
-        "status": int(getattr(r, "status_code", None) or 200),
-        "content_type": "text/markdown",
-        "length_bytes": len(text.encode("utf-8")),
-        "text": text,
-    }
-
+# ─── MCP tools ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def web_search(query: str, max_results: int = 5) -> list[dict]:
@@ -177,8 +200,53 @@ def web_search(query: str, max_results: int = 5) -> list[dict]:
 
 @mcp.tool()
 async def fetch_url(url: str, timeout: int = 20) -> dict:
-    """Fetch clean markdown from a URL via crawl4ai (headless Chromium). Example: fetch_url("https://example.com")."""
-    return await _crawl4ai_fetch(url)
+    """Fetch readable text from a URL via httpx (hard 20 s timeout). Returns plain text extracted from HTML. Example: fetch_url("https://arxiv.org/abs/2301.00001")."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers=_FETCH_HEADERS,
+        ) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+
+        content_type = r.headers.get("content-type", "")
+        raw = r.text
+
+        if "html" in content_type or raw.lstrip().startswith("<"):
+            text = _html_to_text(raw)
+        else:
+            text = raw  # already plain text / markdown / JSON
+
+        if not text:
+            return {
+                "status": r.status_code,
+                "content_type": content_type,
+                "length_bytes": 0,
+                "text": f"[fetch_url] No readable content at {url}",
+            }
+
+        return {
+            "status": r.status_code,
+            "content_type": content_type,
+            "length_bytes": len(text.encode()),
+            "text": text,
+        }
+
+    except httpx.HTTPStatusError as exc:
+        return {
+            "status": exc.response.status_code,
+            "content_type": "",
+            "length_bytes": 0,
+            "text": f"[fetch_url] HTTP {exc.response.status_code} for {url}",
+        }
+    except Exception as exc:
+        return {
+            "status": 0,
+            "content_type": "",
+            "length_bytes": 0,
+            "text": f"[fetch_url] Failed: {exc}",
+        }
 
 
 @mcp.tool()

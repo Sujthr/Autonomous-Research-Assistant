@@ -134,13 +134,19 @@ def decide(
 
     except Exception as exc:
         log.warning("[decision] LLM failed (%s) — fallback heuristic", exc)
-        # Fallback heuristic
+        last = state.action_history[-1] if state.action_history else ""
         if state.session.facts_found >= MIN_FACTS_TO_CONCLUDE:
             return DecisionResult(
                 action="summarize",
                 reason="fallback: enough facts gathered",
                 converged=True,
                 confidence=0.7,
+            )
+        if last == "fetch_url":
+            return DecisionResult(
+                action="save_memory",
+                reason="fallback: save content just fetched",
+                confidence=0.6,
             )
         if state.pending_urls:
             return DecisionResult(
